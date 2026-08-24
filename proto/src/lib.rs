@@ -111,6 +111,16 @@ pub fn petname(id: &[u8; 16]) -> String {
     )
 }
 
+/// Name bytes capped to [`MAX_NAME_BYTES`], truncated on a char boundary so
+/// the result stays valid UTF-8 (decode rejects invalid names wholesale).
+fn name_bytes(name: &str) -> &[u8] {
+    let mut end = name.len().min(MAX_NAME_BYTES);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name.as_bytes()[..end]
+}
+
 impl Packet {
     /// Serialize into `out` (cleared first). The buffer is reusable to keep
     /// the hot path allocation-free.
@@ -133,7 +143,7 @@ impl Packet {
                 out.extend_from_slice(&listen_port.to_le_bytes());
                 out.extend_from_slice(&channels.to_le_bytes());
                 out.extend_from_slice(&sample_rate.to_le_bytes());
-                let name = &name.as_bytes()[..name.len().min(MAX_NAME_BYTES)];
+                let name = name_bytes(name);
                 out.push(name.len() as u8);
                 out.extend_from_slice(name);
             }
@@ -186,7 +196,7 @@ impl Packet {
             Packet::SetName { instance_id, name } => {
                 out.push(7);
                 out.extend_from_slice(instance_id);
-                let name = &name.as_bytes()[..name.len().min(MAX_NAME_BYTES)];
+                let name = name_bytes(name);
                 out.push(name.len() as u8);
                 out.extend_from_slice(name);
             }
@@ -377,6 +387,23 @@ mod tests {
         let mut buf = Vec::new();
         p.encode(&mut buf);
         assert!(buf.len() <= MAX_PACKET_BYTES);
+    }
+
+    #[test]
+    fn long_name_truncates_on_char_boundary() {
+        // 63 ASCII bytes then a 2-byte char straddling the 64-byte cap: the
+        // straddling char must be dropped whole, and the packet must decode.
+        let name = format!("{}ří", "x".repeat(63));
+        let p = Packet::SetName {
+            instance_id: [1; 16],
+            name,
+        };
+        let mut buf = Vec::new();
+        p.encode(&mut buf);
+        let Some(Packet::SetName { name, .. }) = Packet::decode(&buf) else {
+            panic!("truncated name failed to decode");
+        };
+        assert_eq!(name, "x".repeat(63));
     }
 
     #[test]

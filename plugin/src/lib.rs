@@ -16,7 +16,9 @@ use nih_plug_egui::{create_egui_editor, egui, EguiState};
 
 const SESSION_TIMEOUT: Duration = Duration::from_secs(3);
 const BEACON_INTERVAL: Duration = Duration::from_secs(1);
-/// Ring capacity in seconds; must exceed the largest buffer setting.
+/// Ring headroom beyond twice the host's declared max block; must exceed the
+/// largest app-side extra-buffer setting (300 ms) so the top-up target
+/// (2×block + extra) always fits and RingWriter never has to drop frames.
 const RING_SECONDS: f32 = 0.5;
 
 pub struct Bridge {
@@ -271,7 +273,9 @@ impl Plugin for Bridge {
             .sample_rate
             .store(self.sample_rate, Ordering::Relaxed);
 
-        let capacity = (self.sample_rate as f32 * RING_SECONDS) as usize * self.channels;
+        let capacity = ((self.sample_rate as f32 * RING_SECONDS) as usize
+            + buffer_config.max_buffer_size as usize * 2)
+            * self.channels;
         let (producer, consumer) = rtrb::RingBuffer::new(capacity);
         self.consumer = Some(consumer);
 
