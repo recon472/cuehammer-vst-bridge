@@ -1,0 +1,10 @@
+[package]
+name = "bridge-proto"
+version = "0.1.0"
+edition = "2021"
+authors = ["Ondra Michalik"]
+description = "Wire protocol between CueHammer and the CueHammer Bridge plugin"
+license = "MIT"
+publish = false
+
+[dependencies]

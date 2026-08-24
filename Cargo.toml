@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["proto", "plugin", "xtask"]
+
+[profile.release]
+lto = "thin"
+strip = true

@@ -1,0 +1,18 @@
+[package]
+name = "bridge"
+version = "0.1.0"
+edition = "2021"
+authors = ["Ondra Michalik"]
+description = "CueHammer Bridge — receive CueHammer playback as a VST3/CLAP plugin in any host"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+bridge-proto = { path = "../proto" }
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+rtrb = "0.3"
+uuid = { version = "1", features = ["v4"] }
