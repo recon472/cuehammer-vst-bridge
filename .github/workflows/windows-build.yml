@@ -1,0 +1,23 @@
+name: windows-build
+on: workflow_dispatch
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask bundle bridge --release --locked
+      - shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path stage | Out-Null
+          Copy-Item -Recurse "target/bundled/CueHammer Bridge.vst3" "stage/CueHammer Bridge.vst3"
+          Copy-Item LICENSE stage
+          Compress-Archive -Path stage/* -DestinationPath CueHammer-Bridge-windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-vst3
+          path: CueHammer-Bridge-windows.zip
+          if-no-files-found: error
+          retention-days: 1

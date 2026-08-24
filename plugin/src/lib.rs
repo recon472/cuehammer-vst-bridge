@@ -138,7 +138,7 @@ impl Plugin for Bridge {
     const VENDOR: &'static str = "Ondra Michalik";
     const URL: &'static str = "https://cuehammer.com";
     const EMAIL: &'static str = "ondra.michalik@gmail.com";
-    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+    const VERSION: &'static str = env!("BRIDGE_VERSION_DISPLAY");
 
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] =
         &[layout(2), layout(1), layout(4), layout(8), layout(16)];
@@ -189,6 +189,16 @@ impl Plugin for Bridge {
                                     .color(TEXT),
                             );
                             ui.label(egui::RichText::new("Bridge").size(17.0).color(ORANGE));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(Bridge::VERSION)
+                                            .size(10.0)
+                                            .color(MUTED),
+                                    );
+                                },
+                            );
                         });
                         ui.add_space(10.0);
 
