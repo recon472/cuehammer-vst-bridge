@@ -465,6 +465,12 @@ fn net_thread(ctx: NetContext) {
                     Some(s) => s.addr == from || s.token == token,
                 };
                 if free {
+                    // A new controller session counts gaps from zero, matching
+                    // its own baseline; a same-token refresh keeps the total.
+                    if session.as_ref().map_or(true, |s| s.token != token) {
+                        writer.gaps = 0;
+                        reported_gaps = 0;
+                    }
                     *session = Some(Session {
                         addr: from,
                         token,
