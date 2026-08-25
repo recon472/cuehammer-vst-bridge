@@ -167,9 +167,11 @@ impl Plugin for Bridge {
 
         let params = self.params.clone();
         let shared = self.shared.clone();
+        // Editor state: the displayed fill in ms, time-averaged so the
+        // per-block sawtooth of the raw ring fill reads as one number.
         create_egui_editor(
             self.params.editor_state.clone(),
-            (),
+            0.0f32,
             |ctx, _| {
                 let mut style = (*ctx.style()).clone();
                 style.visuals = egui::Visuals::dark();
@@ -179,7 +181,7 @@ impl Plugin for Bridge {
                 style.visuals.selection.bg_fill = ORANGE;
                 ctx.set_style(style);
             },
-            move |ctx, _setter, _state| {
+            move |ctx, _setter, avg: &mut f32| {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::default().fill(BG).inner_margin(14.0))
                     .show(ctx, |ui| {
@@ -229,13 +231,20 @@ impl Plugin for Bridge {
                                 } else {
                                     0.0
                                 };
+                                // ponytail: EMA with a ~1 s time constant; a
+                                // windowed mean only if min/max are ever shown.
+                                let dt = ctx.input(|i| i.stable_dt).min(0.1);
+                                *avg += (fill_ms - *avg) * dt;
                                 let (color, text) = match (&*session, sr) {
                                     (_, 0) => (MUTED, "Inactive".to_string()),
                                     (Some(_), _) => {
-                                        (GREEN, format!("Connected — {fill_ms:.0} ms buffered"))
+                                        (GREEN, format!("Connected — {avg:.0} ms buffered"))
                                     }
                                     (None, _) => (ORANGE, "Waiting for CueHammer".to_string()),
                                 };
+                                if session.is_none() || sr == 0 {
+                                    *avg = 0.0;
+                                }
                                 ui.horizontal(|ui| {
                                     ui.label(egui::RichText::new("●").color(color));
                                     ui.label(egui::RichText::new(text).color(color));
@@ -408,10 +417,12 @@ fn net_thread(ctx: NetContext) {
         producer: ctx.producer,
         next_frame: 0,
         channels: ctx.channels as usize,
+        gaps: 0,
     };
     let mut out = Vec::with_capacity(128);
     let mut buf = [0u8; 2048];
     let mut last_beacon = Instant::now() - BEACON_INTERVAL;
+    let mut reported_gaps = 0u32;
 
     while ctx.run.load(Ordering::Relaxed) {
         if last_beacon.elapsed() >= BEACON_INTERVAL {
@@ -481,8 +492,18 @@ fn net_thread(ctx: NetContext) {
                     continue;
                 }
                 s.last_rx = Instant::now();
+                let (token, addr) = (s.token, s.addr);
                 drop(session);
                 writer.write(start_frame, &samples, &ctx.shared.consumed);
+                if writer.gaps != reported_gaps {
+                    reported_gaps = writer.gaps;
+                    Packet::Gaps {
+                        token,
+                        total: writer.gaps,
+                    }
+                    .encode(&mut out);
+                    let _ = ctx.socket.send_to(&out, addr);
+                }
             }
             Packet::Bye { token } => {
                 let mut session = ctx.shared.session.lock().unwrap();
@@ -525,6 +546,8 @@ struct RingWriter {
     /// Next absolute frame position to be written to the ring.
     next_frame: u64,
     channels: usize,
+    /// Gaps filled with silence (lost or reordered packets) since activation.
+    gaps: u32,
 }
 
 impl RingWriter {
@@ -551,6 +574,7 @@ impl RingWriter {
         };
 
         if start_frame > self.next_frame {
+            self.gaps += 1;
             let gap = (start_frame - self.next_frame) as usize * ch;
             if self.push(&mut std::iter::repeat(0.0f32), gap) < gap {
                 return;
@@ -604,6 +628,7 @@ mod tests {
                 producer,
                 next_frame: 0,
                 channels: 2,
+                gaps: 0,
             },
             consumer,
         )
@@ -626,6 +651,7 @@ mod tests {
         w.write(2, &[5.0, 6.0], &consumed);
         assert_eq!(drain(&mut c), vec![1.0, 2.0, 0.0, 0.0, 5.0, 6.0]);
         assert_eq!(w.next_frame, 3);
+        assert_eq!(w.gaps, 1);
     }
 
     #[test]

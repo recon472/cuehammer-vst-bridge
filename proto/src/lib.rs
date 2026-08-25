@@ -85,6 +85,11 @@ pub enum Packet {
         instance_id: [u8; 16],
         new_id: [u8; 16],
     },
+    /// Plugin -> app, whenever the count changes: total `Audio` gaps (lost or
+    /// reordered packets the plugin filled with silence) since activation.
+    /// Cumulative so a lost report is caught up by the next one; a separate
+    /// kind so older peers just ignore it.
+    Gaps { token: u64, total: u32 },
 }
 
 /// Human-readable handle derived from an instance id, e.g. "Amber-Fox-31".
@@ -208,6 +213,11 @@ impl Packet {
                 out.extend_from_slice(instance_id);
                 out.extend_from_slice(new_id);
             }
+            Packet::Gaps { token, total } => {
+                out.push(9);
+                out.extend_from_slice(&token.to_le_bytes());
+                out.extend_from_slice(&total.to_le_bytes());
+            }
         }
     }
 
@@ -290,6 +300,10 @@ impl Packet {
                     new_id,
                 }
             }
+            9 => Packet::Gaps {
+                token: r.u64()?,
+                total: r.u32()?,
+            },
             _ => return None,
         };
         r.0.is_empty().then_some(packet)
@@ -365,6 +379,7 @@ mod tests {
                 instance_id: [9; 16],
                 new_id: [3; 16],
             },
+            Packet::Gaps { token: 6, total: 3 },
         ];
         let mut buf = Vec::new();
         for p in &packets {
