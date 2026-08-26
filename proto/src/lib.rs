@@ -95,6 +95,15 @@ pub enum Packet {
     /// in the audio callback, the only place that knows a block came up
     /// short — the app can't tell a late packet from one still in flight.
     Underruns { token: u64, total: u32 },
+    /// Plugin -> app: frames `[start_frame, end_frame)` never arrived. The
+    /// app resends them from its render history if it still has them; the
+    /// plugin repeats the request until the hole fills or it has to give up
+    /// (ring nearly dry) and pad with silence.
+    Nack {
+        token: u64,
+        start_frame: u64,
+        end_frame: u64,
+    },
 }
 
 /// Human-readable handle derived from an instance id, e.g. "Amber-Fox-31".
@@ -228,6 +237,16 @@ impl Packet {
                 out.extend_from_slice(&token.to_le_bytes());
                 out.extend_from_slice(&total.to_le_bytes());
             }
+            Packet::Nack {
+                token,
+                start_frame,
+                end_frame,
+            } => {
+                out.push(11);
+                out.extend_from_slice(&token.to_le_bytes());
+                out.extend_from_slice(&start_frame.to_le_bytes());
+                out.extend_from_slice(&end_frame.to_le_bytes());
+            }
         }
     }
 
@@ -318,6 +337,11 @@ impl Packet {
                 token: r.u64()?,
                 total: r.u32()?,
             },
+            11 => Packet::Nack {
+                token: r.u64()?,
+                start_frame: r.u64()?,
+                end_frame: r.u64()?,
+            },
             _ => return None,
         };
         r.0.is_empty().then_some(packet)
@@ -395,6 +419,11 @@ mod tests {
             },
             Packet::Gaps { token: 6, total: 3 },
             Packet::Underruns { token: 7, total: 2 },
+            Packet::Nack {
+                token: 8,
+                start_frame: 1000,
+                end_frame: 1175,
+            },
         ];
         let mut buf = Vec::new();
         for p in &packets {

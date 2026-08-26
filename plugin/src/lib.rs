@@ -4,6 +4,7 @@
 //! app and reports consumption, which is the app's signal to render more.
 //! See `bridge-proto` for the wire protocol.
 
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -16,6 +17,11 @@ use nih_plug_egui::{create_egui_editor, egui, EguiState};
 
 const SESSION_TIMEOUT: Duration = Duration::from_secs(3);
 const BEACON_INTERVAL: Duration = Duration::from_secs(1);
+/// How often an unfilled hole is re-requested from the app (a Nack or its
+/// resend can be lost too). LAN round trips are ~1 ms.
+const NACK_INTERVAL: Duration = Duration::from_millis(5);
+/// Net thread recv timeout: also the tick for re-nacks and give-ups.
+const NET_TICK: Duration = Duration::from_millis(5);
 /// Ring headroom beyond twice the host's declared max block; must exceed the
 /// largest app-side extra-buffer setting (1000 ms) so the top-up target
 /// (2×block + extra) always fits and RingWriter never has to drop frames.
@@ -54,6 +60,9 @@ struct Shared {
     /// Blocks the ring could not fully serve (episodes, not blocks) since
     /// activation; the net thread reports changes to the app.
     underruns: AtomicU32,
+    /// Largest host block seen; the net thread gives up waiting for a
+    /// resend once the ring holds less than this.
+    block_frames: AtomicU32,
 }
 
 struct Session {
@@ -106,6 +115,7 @@ impl Default for Bridge {
                 fill_frames: AtomicU32::new(0),
                 sample_rate: AtomicU32::new(0),
                 underruns: AtomicU32::new(0),
+                block_frames: AtomicU32::new(0),
             }),
             net: None,
             consumer: None,
@@ -309,7 +319,7 @@ impl Plugin for Bridge {
             }
         };
         let _ = socket.set_broadcast(true);
-        let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
+        let _ = socket.set_read_timeout(Some(NET_TICK));
         let audio_socket = match socket.try_clone() {
             Ok(s) => {
                 let _ = s.set_nonblocking(true);
@@ -400,6 +410,9 @@ impl Plugin for Bridge {
             // configured in CueHammer and added on the app side.
             self.max_block_frames = self.max_block_frames.max(frames as u32);
             let target_frames = self.max_block_frames * 2;
+            self.shared
+                .block_frames
+                .store(self.max_block_frames, Ordering::Relaxed);
 
             // try_lock: never block the audio thread on the session mutex; a
             // skipped Consumed just means the app tops up one block later.
@@ -448,10 +461,12 @@ fn net_thread(ctx: NetContext) {
         next_frame: 0,
         channels: ctx.channels as usize,
         gaps: 0,
+        stash: BTreeMap::new(),
     };
     let mut out = Vec::with_capacity(128);
     let mut buf = [0u8; 2048];
     let mut last_beacon = Instant::now() - BEACON_INTERVAL;
+    let mut last_nack = Instant::now();
     let mut reported_gaps = 0u32;
     let mut reported_underruns = 0u32;
 
@@ -495,7 +510,45 @@ fn net_thread(ctx: NetContext) {
             }
         }
 
-        let (len, from) = match ctx.socket.recv_from(&mut buf) {
+        let received = ctx.socket.recv_from(&mut buf);
+
+        // Holes waiting on a resend: give up on those the ring can no
+        // longer afford to wait for (silence + gap), re-request the rest.
+        if !writer.stash.is_empty() {
+            writer.give_up(
+                ctx.shared.consumed.load(Ordering::Relaxed),
+                ctx.shared.block_frames.load(Ordering::Relaxed) as u64,
+            );
+            if writer.gaps != reported_gaps {
+                reported_gaps = writer.gaps;
+                let session = ctx.shared.session.lock().unwrap();
+                if let Some(s) = &*session {
+                    Packet::Gaps {
+                        token: s.token,
+                        total: writer.gaps,
+                    }
+                    .encode(&mut out);
+                    let _ = ctx.socket.send_to(&out, s.addr);
+                }
+            }
+            if !writer.stash.is_empty() && last_nack.elapsed() >= NACK_INTERVAL {
+                last_nack = Instant::now();
+                let session = ctx.shared.session.lock().unwrap();
+                if let Some(s) = &*session {
+                    for (start_frame, end_frame) in writer.holes() {
+                        Packet::Nack {
+                            token: s.token,
+                            start_frame,
+                            end_frame,
+                        }
+                        .encode(&mut out);
+                        let _ = ctx.socket.send_to(&out, s.addr);
+                    }
+                }
+            }
+        }
+
+        let (len, from) = match received {
             Ok(ok) => ok,
             Err(_) => continue,
         };
@@ -515,6 +568,7 @@ fn net_thread(ctx: NetContext) {
                     // its own baseline; a same-token refresh keeps the total.
                     if session.as_ref().map_or(true, |s| s.token != token) {
                         writer.gaps = 0;
+                        writer.stash.clear();
                         reported_gaps = 0;
                         ctx.shared.underruns.store(0, Ordering::Relaxed);
                         reported_underruns = 0;
@@ -546,17 +600,10 @@ fn net_thread(ctx: NetContext) {
                     continue;
                 }
                 s.last_rx = Instant::now();
-                let (token, addr) = (s.token, s.addr);
                 drop(session);
-                writer.write(start_frame, &samples, &ctx.shared.consumed);
-                if writer.gaps != reported_gaps {
-                    reported_gaps = writer.gaps;
-                    Packet::Gaps {
-                        token,
-                        total: writer.gaps,
-                    }
-                    .encode(&mut out);
-                    let _ = ctx.socket.send_to(&out, addr);
+                // A new hole: request it on this very tick, not the next.
+                if writer.write(start_frame, &samples, &ctx.shared.consumed) {
+                    last_nack = Instant::now() - NACK_INTERVAL;
                 }
             }
             Packet::Bye { token } => {
@@ -600,41 +647,92 @@ struct RingWriter {
     /// Next absolute frame position to be written to the ring.
     next_frame: u64,
     channels: usize,
-    /// Gaps filled with silence (lost or reordered packets) since activation.
+    /// Holes given up on and filled with silence since activation.
     gaps: u32,
+    /// Packets that arrived ahead of a hole, keyed by start frame. They wait
+    /// for the app's resend and are pushed the moment the hole closes.
+    stash: BTreeMap<u64, Vec<f32>>,
 }
 
 impl RingWriter {
     /// Write interleaved samples starting at an absolute frame position.
-    /// Late samples are dropped, gaps (lost packets) become silence, and
+    /// Late samples are dropped; a packet past a hole is stashed (returns
+    /// true: the hole should be nacked) instead of silence-filling the hole;
     /// after an underrun the position fast-forwards to the consumed clock so
     /// stale silence never adds latency.
-    fn write(&mut self, start_frame: u64, samples: &[f32], consumed: &AtomicU64) {
-        let ch = self.channels;
+    fn write(&mut self, start_frame: u64, samples: &[f32], consumed: &AtomicU64) -> bool {
         let consumed = consumed.load(Ordering::Relaxed);
         if self.next_frame < consumed {
             self.next_frame = consumed;
         }
+        if start_frame > self.next_frame {
+            self.stash.insert(start_frame, samples.to_vec());
+            return true;
+        }
+        self.push_at(start_frame, samples);
+        self.drain_stash();
+        false
+    }
 
+    /// Push samples at a position at or before `next_frame`, trimming the
+    /// already-covered head. Returns false if the ring came up short.
+    fn push_at(&mut self, start_frame: u64, samples: &[f32]) -> bool {
+        let ch = self.channels;
         let frames = samples.len() / ch;
         if start_frame + frames as u64 <= self.next_frame {
-            return;
+            return true;
         }
-        let (start_frame, samples) = if start_frame < self.next_frame {
-            let skip = (self.next_frame - start_frame) as usize;
-            (self.next_frame, &samples[skip * ch..])
-        } else {
-            (start_frame, samples)
-        };
+        let skip = (self.next_frame - start_frame) as usize * ch;
+        let samples = &samples[skip..];
+        self.push(&mut samples.iter().copied(), samples.len()) == samples.len()
+    }
 
-        if start_frame > self.next_frame {
+    /// Push every stashed packet that now touches `next_frame`.
+    fn drain_stash(&mut self) {
+        while let Some(entry) = self.stash.first_entry() {
+            if *entry.key() > self.next_frame {
+                return;
+            }
+            let (start, samples) = entry.remove_entry();
+            if !self.push_at(start, &samples) {
+                return;
+            }
+        }
+    }
+
+    /// Frame ranges the stash is waiting on, oldest first.
+    fn holes(&self) -> Vec<(u64, u64)> {
+        let mut holes = Vec::new();
+        let mut prev = self.next_frame;
+        for (start, samples) in &self.stash {
+            if *start > prev {
+                holes.push((prev, *start));
+            }
+            prev = prev.max(start + (samples.len() / self.channels) as u64);
+        }
+        holes
+    }
+
+    /// Stop waiting for resends the ring can no longer afford: while less
+    /// than one host block is buffered, silence-fill the oldest hole and
+    /// count it as a gap.
+    // ponytail: threshold = one host block; make it a setting if a resend
+    // ever needs more than that.
+    fn give_up(&mut self, consumed: u64, block: u64) {
+        loop {
+            self.drain_stash();
+            let Some(&first) = self.stash.keys().next() else {
+                return;
+            };
+            if self.next_frame.saturating_sub(consumed) >= block {
+                return;
+            }
             self.gaps += 1;
-            let gap = (start_frame - self.next_frame) as usize * ch;
+            let gap = (first - self.next_frame) as usize * self.channels;
             if self.push(&mut std::iter::repeat(0.0f32), gap) < gap {
                 return;
             }
         }
-        self.push(&mut samples.iter().copied(), samples.len());
     }
 
     /// Push up to `want` samples (floored to whole frames) from the
@@ -683,6 +781,7 @@ mod tests {
                 next_frame: 0,
                 channels: 2,
                 gaps: 0,
+                stash: BTreeMap::new(),
             },
             consumer,
         )
@@ -697,15 +796,37 @@ mod tests {
     }
 
     #[test]
-    fn ring_in_order_and_gap_fill() {
+    fn ring_stashes_and_recovers() {
+        let (mut w, mut c) = writer(64);
+        let consumed = AtomicU64::new(0);
+        assert!(!w.write(0, &[1.0, 2.0], &consumed));
+        // Frame 2 with frame 1 missing: held back, hole reported, no silence.
+        assert!(w.write(2, &[5.0, 6.0], &consumed));
+        assert_eq!(w.holes(), vec![(1, 2)]);
+        assert_eq!(drain(&mut c), vec![1.0, 2.0]);
+        assert_eq!(w.gaps, 0);
+        // The resend closes the hole and the stash follows in order.
+        assert!(!w.write(1, &[3.0, 4.0], &consumed));
+        assert_eq!(drain(&mut c), vec![3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(w.next_frame, 3);
+        assert!(w.stash.is_empty());
+        assert_eq!(w.gaps, 0);
+    }
+
+    #[test]
+    fn ring_gives_up_when_short() {
         let (mut w, mut c) = writer(64);
         let consumed = AtomicU64::new(0);
         w.write(0, &[1.0, 2.0], &consumed);
-        // Frame 2 with frame 1 lost: one frame of silence fills the gap.
         w.write(2, &[5.0, 6.0], &consumed);
+        // Plenty buffered relative to the block: keep waiting.
+        w.give_up(0, 1);
+        assert_eq!(w.gaps, 0);
+        // Less than a block left: silence the hole and move on.
+        w.give_up(0, 1000);
         assert_eq!(drain(&mut c), vec![1.0, 2.0, 0.0, 0.0, 5.0, 6.0]);
-        assert_eq!(w.next_frame, 3);
         assert_eq!(w.gaps, 1);
+        assert!(w.stash.is_empty());
     }
 
     #[test]
@@ -742,6 +863,7 @@ mod tests {
             fill_frames: AtomicU32::new(0),
             sample_rate: AtomicU32::new(48000),
             underruns: AtomicU32::new(0),
+            block_frames: AtomicU32::new(0),
         });
         let (producer, mut consumer) = rtrb::RingBuffer::new(256);
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -804,6 +926,32 @@ mod tests {
         }
         assert_eq!(drain(&mut consumer), vec![0.25, -0.25]);
 
+        // Frame 2 without frame 1: the plugin asks for the hole instead of
+        // padding it.
+        Packet::Audio {
+            token: 42,
+            start_frame: 2,
+            channels: 2,
+            samples: vec![0.5, -0.5],
+        }
+        .encode(&mut out);
+        app.send_to(&out, plugin_addr).unwrap();
+        let nack = loop {
+            let (len, _) = app.recv_from(&mut buf).expect("nack never arrived");
+            if let Some(p @ Packet::Nack { .. }) = Packet::decode(&buf[..len]) {
+                break p;
+            }
+        };
+        assert_eq!(
+            nack,
+            Packet::Nack {
+                token: 42,
+                start_frame: 1,
+                end_frame: 2
+            }
+        );
+        assert_eq!(consumer.slots(), 0, "stashed audio must not reach the ring");
+
         Packet::Bye { token: 42 }.encode(&mut out);
         app.send_to(&out, plugin_addr).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -843,6 +991,7 @@ mod tests {
                     fill_frames: AtomicU32::new(0),
                     sample_rate: AtomicU32::new(48000),
                     underruns: AtomicU32::new(0),
+                    block_frames: AtomicU32::new(0),
                 }),
                 params: params.clone(),
                 run: run.clone(),
