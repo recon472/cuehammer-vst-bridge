@@ -17,9 +17,9 @@ use nih_plug_egui::{create_egui_editor, egui, EguiState};
 const SESSION_TIMEOUT: Duration = Duration::from_secs(3);
 const BEACON_INTERVAL: Duration = Duration::from_secs(1);
 /// Ring headroom beyond twice the host's declared max block; must exceed the
-/// largest app-side extra-buffer setting (300 ms) so the top-up target
+/// largest app-side extra-buffer setting (1000 ms) so the top-up target
 /// (2×block + extra) always fits and RingWriter never has to drop frames.
-const RING_SECONDS: f32 = 0.5;
+const RING_SECONDS: f32 = 1.5;
 
 pub struct Bridge {
     params: Arc<BridgeParams>,
@@ -34,6 +34,10 @@ pub struct Bridge {
     /// Largest block the host has actually delivered since activation; the
     /// auto buffer target is twice this.
     max_block_frames: u32,
+    /// The app has filled the ring at least once this session, so a short
+    /// block is a real underrun rather than the handshake's empty ring.
+    primed: bool,
+    in_underrun: bool,
     /// Random per-plugin-object nonce, NOT persisted: lets the app tell a
     /// duplicated state chunk (two live objects, same instance id) from the
     /// same instance re-announcing after a rebind.
@@ -47,6 +51,9 @@ struct Shared {
     consumed: AtomicU64,
     fill_frames: AtomicU32,
     sample_rate: AtomicU32,
+    /// Blocks the ring could not fully serve (episodes, not blocks) since
+    /// activation; the net thread reports changes to the app.
+    underruns: AtomicU32,
 }
 
 struct Session {
@@ -98,6 +105,7 @@ impl Default for Bridge {
                 consumed: AtomicU64::new(0),
                 fill_frames: AtomicU32::new(0),
                 sample_rate: AtomicU32::new(0),
+                underruns: AtomicU32::new(0),
             }),
             net: None,
             consumer: None,
@@ -106,6 +114,8 @@ impl Default for Bridge {
             channels: 2,
             sample_rate: 0,
             max_block_frames: 0,
+            primed: false,
+            in_underrun: false,
             boot_id: uuid::Uuid::new_v4().as_u128() as u64,
         }
     }
@@ -122,6 +132,9 @@ impl Bridge {
         *self.shared.session.lock().unwrap() = None;
         self.shared.consumed.store(0, Ordering::Relaxed);
         self.shared.fill_frames.store(0, Ordering::Relaxed);
+        self.shared.underruns.store(0, Ordering::Relaxed);
+        self.primed = false;
+        self.in_underrun = false;
     }
 }
 
@@ -348,6 +361,19 @@ impl Plugin for Bridge {
         if let Some(consumer) = self.consumer.as_mut() {
             let avail = consumer.slots();
             let want = frames * channels;
+            let short = avail < want;
+            // Episodes, not blocks; zero-frame flush calls carry no
+            // information and must not prime or end an episode.
+            if want > 0 {
+                if short {
+                    if self.primed && !self.in_underrun {
+                        self.shared.underruns.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    self.primed = true;
+                }
+                self.in_underrun = short;
+            }
             let take = avail.min(want) / channels * channels;
             if take > 0 {
                 if let Ok(chunk) = consumer.read_chunk(take) {
@@ -380,6 +406,10 @@ impl Plugin for Bridge {
             if let (Some(socket), Ok(session)) =
                 (self.audio_socket.as_ref(), self.shared.session.try_lock())
             {
+                // No controller: the ring draining is not an underrun.
+                if session.is_none() {
+                    self.primed = false;
+                }
                 if let Some(session) = &*session {
                     Packet::Consumed {
                         token: session.token,
@@ -423,8 +453,24 @@ fn net_thread(ctx: NetContext) {
     let mut buf = [0u8; 2048];
     let mut last_beacon = Instant::now() - BEACON_INTERVAL;
     let mut reported_gaps = 0u32;
+    let mut reported_underruns = 0u32;
 
     while ctx.run.load(Ordering::Relaxed) {
+        // Underruns are counted on the audio thread; report changes from
+        // here, at worst one recv timeout (100 ms) late.
+        let underruns = ctx.shared.underruns.load(Ordering::Relaxed);
+        if underruns != reported_underruns {
+            let session = ctx.shared.session.lock().unwrap();
+            if let Some(s) = &*session {
+                reported_underruns = underruns;
+                Packet::Underruns {
+                    token: s.token,
+                    total: underruns,
+                }
+                .encode(&mut out);
+                let _ = ctx.socket.send_to(&out, s.addr);
+            }
+        }
         if last_beacon.elapsed() >= BEACON_INTERVAL {
             last_beacon = Instant::now();
             Packet::Beacon {
@@ -470,6 +516,8 @@ fn net_thread(ctx: NetContext) {
                     if session.as_ref().map_or(true, |s| s.token != token) {
                         writer.gaps = 0;
                         reported_gaps = 0;
+                        ctx.shared.underruns.store(0, Ordering::Relaxed);
+                        reported_underruns = 0;
                     }
                     *session = Some(Session {
                         addr: from,
@@ -693,6 +741,7 @@ mod tests {
             consumed: AtomicU64::new(0),
             fill_frames: AtomicU32::new(0),
             sample_rate: AtomicU32::new(48000),
+            underruns: AtomicU32::new(0),
         });
         let (producer, mut consumer) = rtrb::RingBuffer::new(256);
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -793,6 +842,7 @@ mod tests {
                     consumed: AtomicU64::new(0),
                     fill_frames: AtomicU32::new(0),
                     sample_rate: AtomicU32::new(48000),
+                    underruns: AtomicU32::new(0),
                 }),
                 params: params.clone(),
                 run: run.clone(),

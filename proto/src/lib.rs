@@ -90,6 +90,11 @@ pub enum Packet {
     /// Cumulative so a lost report is caught up by the next one; a separate
     /// kind so older peers just ignore it.
     Gaps { token: u64, total: u32 },
+    /// Plugin -> app, whenever the count changes: total ring underruns (host
+    /// blocks the plugin had to pad with silence) since activation. Counted
+    /// in the audio callback, the only place that knows a block came up
+    /// short — the app can't tell a late packet from one still in flight.
+    Underruns { token: u64, total: u32 },
 }
 
 /// Human-readable handle derived from an instance id, e.g. "Amber-Fox-31".
@@ -218,6 +223,11 @@ impl Packet {
                 out.extend_from_slice(&token.to_le_bytes());
                 out.extend_from_slice(&total.to_le_bytes());
             }
+            Packet::Underruns { token, total } => {
+                out.push(10);
+                out.extend_from_slice(&token.to_le_bytes());
+                out.extend_from_slice(&total.to_le_bytes());
+            }
         }
     }
 
@@ -304,6 +314,10 @@ impl Packet {
                 token: r.u64()?,
                 total: r.u32()?,
             },
+            10 => Packet::Underruns {
+                token: r.u64()?,
+                total: r.u32()?,
+            },
             _ => return None,
         };
         r.0.is_empty().then_some(packet)
@@ -380,6 +394,7 @@ mod tests {
                 new_id: [3; 16],
             },
             Packet::Gaps { token: 6, total: 3 },
+            Packet::Underruns { token: 7, total: 2 },
         ];
         let mut buf = Vec::new();
         for p in &packets {
