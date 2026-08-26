@@ -472,7 +472,7 @@ fn net_thread(ctx: NetContext) {
 
     while ctx.run.load(Ordering::Relaxed) {
         // Underruns are counted on the audio thread; report changes from
-        // here, at worst one recv timeout (100 ms) late.
+        // here, at worst one recv timeout (NET_TICK) late.
         let underruns = ctx.shared.underruns.load(Ordering::Relaxed);
         if underruns != reported_underruns {
             let session = ctx.shared.session.lock().unwrap();
@@ -601,7 +601,9 @@ fn net_thread(ctx: NetContext) {
                 }
                 s.last_rx = Instant::now();
                 drop(session);
-                // A new hole: request it on this very tick, not the next.
+                // A new hole: nack it as soon as the loop comes round (the
+                // next packet, or at worst one NET_TICK), not a full
+                // NACK_INTERVAL later.
                 if writer.write(start_frame, &samples, &ctx.shared.consumed) {
                     last_nack = Instant::now() - NACK_INTERVAL;
                 }
@@ -688,6 +690,9 @@ impl RingWriter {
     }
 
     /// Push every stashed packet that now touches `next_frame`.
+    // ponytail: a packet the full ring only half takes loses its tail; the
+    // gap that leaves is nacked and resent, and RING_HEADROOM is sized so
+    // the ring never fills. Reinsert the remainder if that ever changes.
     fn drain_stash(&mut self) {
         while let Some(entry) = self.stash.first_entry() {
             if *entry.key() > self.next_frame {
@@ -716,9 +721,17 @@ impl RingWriter {
     /// Stop waiting for resends the ring can no longer afford: while less
     /// than one host block is buffered, silence-fill the oldest hole and
     /// count it as a gap.
-    // ponytail: threshold = one host block; make it a setting if a resend
+    // ponytail: threshold = one host block, checked once per NET_TICK, so a
+    // host with blocks shorter than the tick underruns before give-up fires
+    // (counted as an underrun, not a gap). Make it a setting if a resend
     // ever needs more than that.
     fn give_up(&mut self, consumed: u64, block: u64) {
+        // Same clamp as `write`: after an underrun the past is gone, so a
+        // hole (and any stash) below `consumed` must not be pushed as stale
+        // latency.
+        if self.next_frame < consumed {
+            self.next_frame = consumed;
+        }
         loop {
             self.drain_stash();
             let Some(&first) = self.stash.keys().next() else {
@@ -827,6 +840,22 @@ mod tests {
         assert_eq!(drain(&mut c), vec![1.0, 2.0, 0.0, 0.0, 5.0, 6.0]);
         assert_eq!(w.gaps, 1);
         assert!(w.stash.is_empty());
+    }
+
+    #[test]
+    fn ring_give_up_skips_the_past_after_underrun() {
+        let (mut w, mut c) = writer(64);
+        let consumed = AtomicU64::new(0);
+        w.write(0, &[1.0, 2.0], &consumed);
+        w.write(2, &[5.0, 6.0], &consumed);
+        drain(&mut c);
+        // The host played through frame 5 while the hole was open: neither
+        // the hole nor the stashed frame 2 may reach the ring as stale audio.
+        w.give_up(6, 1000);
+        assert_eq!(drain(&mut c), Vec::<f32>::new());
+        assert_eq!(w.next_frame, 6);
+        assert!(w.stash.is_empty());
+        assert_eq!(w.gaps, 0);
     }
 
     #[test]
