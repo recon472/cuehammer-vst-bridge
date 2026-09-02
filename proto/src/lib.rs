@@ -13,7 +13,10 @@
 /// clear of Dante (319/320, 4440-4455, 5353, 8700-8899, 14336+).
 pub const DISCOVERY_PORT: u16 = 27413;
 
-pub const VERSION: u8 = 1;
+/// Bumped whenever an older peer could not play what a newer one sends
+/// (v2: `Silence` replaces all-zero `Audio`). Peers on another version see
+/// nothing from each other; the app warns about a mismatched beacon.
+pub const VERSION: u8 = 2;
 pub const MAX_NAME_BYTES: usize = 64;
 /// Keep every datagram under a conservative Ethernet MTU.
 pub const MAX_PACKET_BYTES: usize = 1400;
@@ -104,6 +107,20 @@ pub enum Packet {
         start_frame: u64,
         end_frame: u64,
     },
+    /// App -> plugin: `frames` frames of digital silence from `start_frame`.
+    /// Stands in for an all-zero `Audio` so an idle 16-channel session
+    /// costs ~50 tiny packets a second instead of 25 Mbit/s.
+    Silence {
+        token: u64,
+        start_frame: u64,
+        frames: u16,
+    },
+}
+
+/// The protocol version byte of a datagram that carries our magic, whatever
+/// its version — so the app can tell "old plugin" from noise.
+pub fn peek_version(buf: &[u8]) -> Option<u8> {
+    (buf.len() >= HEADER_BYTES && buf[0..4] == MAGIC).then(|| buf[4])
 }
 
 /// Human-readable handle derived from an instance id, e.g. "Amber-Fox-31".
@@ -247,6 +264,16 @@ impl Packet {
                 out.extend_from_slice(&start_frame.to_le_bytes());
                 out.extend_from_slice(&end_frame.to_le_bytes());
             }
+            Packet::Silence {
+                token,
+                start_frame,
+                frames,
+            } => {
+                out.push(12);
+                out.extend_from_slice(&token.to_le_bytes());
+                out.extend_from_slice(&start_frame.to_le_bytes());
+                out.extend_from_slice(&frames.to_le_bytes());
+            }
         }
     }
 
@@ -342,6 +369,11 @@ impl Packet {
                 start_frame: r.u64()?,
                 end_frame: r.u64()?,
             },
+            12 => Packet::Silence {
+                token: r.u64()?,
+                start_frame: r.u64()?,
+                frames: r.u16()?,
+            },
             _ => return None,
         };
         r.0.is_empty().then_some(packet)
@@ -424,6 +456,11 @@ mod tests {
                 start_frame: 1000,
                 end_frame: 1175,
             },
+            Packet::Silence {
+                token: 9,
+                start_frame: 2000,
+                frames: 1024,
+            },
         ];
         let mut buf = Vec::new();
         for p in &packets {
@@ -468,7 +505,14 @@ mod tests {
     #[test]
     fn rejects_garbage() {
         assert_eq!(Packet::decode(b"nope"), None);
-        assert_eq!(Packet::decode(b"CHBR\x01\x63"), None);
+        assert_eq!(peek_version(b"nope"), None);
+        assert_eq!(
+            Packet::decode(b"CHBR\x01\x02"),
+            None,
+            "old version rejected"
+        );
+        assert_eq!(peek_version(b"CHBR\x01\x02"), Some(1));
+        assert_eq!(Packet::decode(b"CHBR\x02\x63"), None);
         let mut buf = Vec::new();
         Packet::Hello { token: 9 }.encode(&mut buf);
         buf.push(0);

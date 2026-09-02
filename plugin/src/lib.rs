@@ -101,6 +101,27 @@ fn unpack_addr(packed: u64) -> SocketAddr {
     SocketAddr::from((Ipv4Addr::from((packed >> 16) as u32), packed as u16))
 }
 
+/// macOS picks the wifi WMM queue from the socket's service type, not from
+/// IP_TOS: mark the socket as interactive voice so Consumed (the app's pull
+/// signal) and nacks get airtime priority over bulk traffic on this
+/// machine's radio.
+#[cfg(target_os = "macos")]
+fn set_voice_service_type(socket: &UdpSocket) {
+    use std::os::fd::AsRawFd;
+    const SO_NET_SERVICE_TYPE: libc::c_int = 0x1116;
+    const NET_SERVICE_TYPE_VO: libc::c_int = 4;
+    // SAFETY: setsockopt on a live fd with a correctly sized c_int.
+    unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            SO_NET_SERVICE_TYPE,
+            &NET_SERVICE_TYPE_VO as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
 struct NetThread {
     run: Arc<AtomicBool>,
     handle: std::thread::JoinHandle<()>,
@@ -365,6 +386,12 @@ impl Plugin for Bridge {
         };
         let _ = socket.set_broadcast(true);
         let _ = socket.set_read_timeout(Some(NET_TICK));
+        // A top-up burst is up to 4 host blocks × 16 ch of f32, and the OS
+        // default receive buffer (64 KB on Windows) holds ~20 ms of that:
+        // a net thread scheduled late would lose the tail to nacks.
+        let _ = socket2::SockRef::from(&socket).set_recv_buffer_size(4 << 20);
+        #[cfg(target_os = "macos")]
+        set_voice_service_type(&socket);
         let audio_socket = match socket.try_clone() {
             Ok(s) => {
                 let _ = s.set_nonblocking(true);
@@ -499,7 +526,40 @@ struct NetContext {
     boot_id: u64,
 }
 
+/// Where beacons go: limited broadcast, loopback, and every interface's own
+/// subnet broadcast — 255.255.255.255 leaves on the default-route interface
+/// only, which is the internet-facing wifi on a typical FOH laptop, not the
+/// audio LAN. Re-enumerated per beacon so a cable plugged in later counts.
+fn beacon_targets() -> Vec<Ipv4Addr> {
+    let mut targets = vec![Ipv4Addr::BROADCAST, Ipv4Addr::LOCALHOST];
+    for iface in get_if_addrs::get_if_addrs().unwrap_or_default() {
+        if let get_if_addrs::IfAddr::V4(v4) = iface.addr {
+            if let Some(b) = v4.broadcast.filter(|b| !targets.contains(b)) {
+                targets.push(b);
+            }
+        }
+    }
+    targets
+}
+
+/// Session check shared by the packets that carry audio: right token, right
+/// controller, and it refreshes the session timeout.
+fn accept_audio(shared: &Shared, token: u64, from: SocketAddr) -> bool {
+    let mut session = shared.session.lock().unwrap();
+    match session.as_mut() {
+        Some(s) if s.token == token && s.addr == from => {
+            s.last_rx = Instant::now();
+            true
+        }
+        _ => false,
+    }
+}
+
 fn net_thread(ctx: NetContext) {
+    // This thread feeds the audio thread's ring: a late wakeup under a busy
+    // DAW GUI is an underrun. Same footing as the app's render thread.
+    let _ = thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Max);
+
     let mut instance_id = uuid::Uuid::parse_str(&ctx.params.instance_id.read().unwrap())
         .map(|u| *u.as_bytes())
         .unwrap_or_default();
@@ -513,6 +573,8 @@ fn net_thread(ctx: NetContext) {
     };
     let mut out = Vec::with_capacity(128);
     let mut buf = [0u8; 2048];
+    // Zero source for `Silence`; grows to the largest run seen, never shrinks.
+    let mut zeros: Vec<f32> = Vec::new();
     let mut last_beacon = Instant::now() - BEACON_INTERVAL;
     let mut last_nack = Instant::now();
     let mut reported_gaps = 0u32;
@@ -545,7 +607,7 @@ fn net_thread(ctx: NetContext) {
                 name: ctx.params.name.read().unwrap().clone(),
             }
             .encode(&mut out);
-            for ip in [Ipv4Addr::BROADCAST, Ipv4Addr::LOCALHOST] {
+            for ip in beacon_targets() {
                 let _ = ctx.socket.send_to(&out, (ip, DISCOVERY_PORT));
             }
 
@@ -644,17 +706,29 @@ fn net_thread(ctx: NetContext) {
                 channels,
                 samples,
             } => {
-                let mut session = ctx.shared.session.lock().unwrap();
-                let Some(s) = session.as_mut() else { continue };
-                if s.token != token || s.addr != from || channels != ctx.channels {
+                if channels != ctx.channels || !accept_audio(&ctx.shared, token, from) {
                     continue;
                 }
-                s.last_rx = Instant::now();
-                drop(session);
                 // A new hole: nack it as soon as the loop comes round (the
                 // next packet, or at worst one NET_TICK), not a full
                 // NACK_INTERVAL later.
                 if writer.write(start_frame, &samples, &ctx.shared.consumed) {
+                    last_nack = Instant::now() - NACK_INTERVAL;
+                }
+            }
+            Packet::Silence {
+                token,
+                start_frame,
+                frames,
+            } => {
+                if !accept_audio(&ctx.shared, token, from) {
+                    continue;
+                }
+                let n = frames as usize * ctx.channels as usize;
+                if zeros.len() < n {
+                    zeros.resize(n, 0.0);
+                }
+                if writer.write(start_frame, &zeros[..n], &ctx.shared.consumed) {
                     last_nack = Instant::now() - NACK_INTERVAL;
                 }
             }
@@ -1008,11 +1082,26 @@ mod tests {
         }
         assert_eq!(drain(&mut consumer), vec![0.25, -0.25]);
 
-        // Frame 2 without frame 1: the plugin asks for the hole instead of
+        // Silence lands as zero frames on the same timeline.
+        Packet::Silence {
+            token: 42,
+            start_frame: 1,
+            frames: 1,
+        }
+        .encode(&mut out);
+        app.send_to(&out, plugin_addr).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while consumer.slots() < 2 {
+            assert!(Instant::now() < deadline, "silence never reached the ring");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(drain(&mut consumer), vec![0.0, 0.0]);
+
+        // Frame 3 without frame 2: the plugin asks for the hole instead of
         // padding it.
         Packet::Audio {
             token: 42,
-            start_frame: 2,
+            start_frame: 3,
             channels: 2,
             samples: vec![0.5, -0.5],
         }
@@ -1028,8 +1117,8 @@ mod tests {
             nack,
             Packet::Nack {
                 token: 42,
-                start_frame: 1,
-                end_frame: 2
+                start_frame: 2,
+                end_frame: 3
             }
         );
         assert_eq!(consumer.slots(), 0, "stashed audio must not reach the ring");
