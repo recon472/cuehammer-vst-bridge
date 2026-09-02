@@ -53,6 +53,13 @@ pub struct Bridge {
 /// State shared between the audio thread, the network thread and the editor.
 struct Shared {
     session: Mutex<Option<Session>>,
+    /// Lock-free copy of the session for the audio thread: token (0 = no
+    /// session) and the controller's IPv4 address packed as `ip << 16 |
+    /// port`. The net thread republishes on every session change so
+    /// `process()` never touches the mutex (a skipped Consumed under
+    /// contention meant a late top-up).
+    pub_token: AtomicU64,
+    pub_addr: AtomicU64,
     /// Total frames output since activation; the stream timeline.
     consumed: AtomicU64,
     fill_frames: AtomicU32,
@@ -69,6 +76,29 @@ struct Session {
     addr: SocketAddr,
     token: u64,
     last_rx: Instant,
+}
+
+/// Mirror the session (or its absence) into the audio thread's atomics.
+fn publish_session(shared: &Shared, session: Option<&Session>) {
+    match session {
+        Some(s) => {
+            let packed = match s.addr {
+                SocketAddr::V4(a) => ((u32::from(*a.ip()) as u64) << 16) | a.port() as u64,
+                // The socket is bound to an IPv4 address, so peers are V4.
+                SocketAddr::V6(_) => 0,
+            };
+            shared.pub_addr.store(packed, Ordering::Relaxed);
+            shared.pub_token.store(s.token, Ordering::Release);
+        }
+        None => {
+            shared.pub_token.store(0, Ordering::Release);
+            shared.pub_addr.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+fn unpack_addr(packed: u64) -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::from((packed >> 16) as u32), packed as u16))
 }
 
 struct NetThread {
@@ -111,6 +141,8 @@ impl Default for Bridge {
             params: Arc::new(BridgeParams::default()),
             shared: Arc::new(Shared {
                 session: Mutex::new(None),
+                pub_token: AtomicU64::new(0),
+                pub_addr: AtomicU64::new(0),
                 consumed: AtomicU64::new(0),
                 fill_frames: AtomicU32::new(0),
                 sample_rate: AtomicU32::new(0),
@@ -137,9 +169,22 @@ impl Bridge {
             net.run.store(false, Ordering::Relaxed);
             let _ = net.handle.join();
         }
+        // Tell the controller right away instead of letting it find out
+        // from the 5 s beacon timeout: its backup output takes over sooner.
+        if let (Some(socket), Some(session)) = (
+            self.audio_socket.as_ref(),
+            self.shared.session.lock().unwrap().as_ref(),
+        ) {
+            Packet::Bye {
+                token: session.token,
+            }
+            .encode(&mut self.scratch);
+            let _ = socket.send_to(&self.scratch, session.addr);
+        }
         self.consumer = None;
         self.audio_socket = None;
         *self.shared.session.lock().unwrap() = None;
+        publish_session(&self.shared, None);
         self.shared.consumed.store(0, Ordering::Relaxed);
         self.shared.fill_frames.store(0, Ordering::Relaxed);
         self.shared.underruns.store(0, Ordering::Relaxed);
@@ -367,6 +412,11 @@ impl Plugin for Bridge {
         let frames = buffer.samples();
         let channels = self.channels;
         let output = buffer.as_slice();
+        // Output only what CueHammer sends: the host's input is not passed
+        // through, and frames the ring can't supply are silence.
+        for ch in output.iter_mut() {
+            ch.fill(0.0);
+        }
 
         if let Some(consumer) = self.consumer.as_mut() {
             let avail = consumer.slots();
@@ -389,7 +439,7 @@ impl Plugin for Bridge {
                 if let Ok(chunk) = consumer.read_chunk(take) {
                     let (a, b) = chunk.as_slices();
                     for (i, s) in a.iter().chain(b.iter()).enumerate() {
-                        output[i % channels][i / channels] += *s;
+                        output[i % channels][i / channels] = *s;
                     }
                     chunk.commit_all();
                 }
@@ -414,25 +464,23 @@ impl Plugin for Bridge {
                 .block_frames
                 .store(self.max_block_frames, Ordering::Relaxed);
 
-            // try_lock: never block the audio thread on the session mutex; a
-            // skipped Consumed just means the app tops up one block later.
-            if let (Some(socket), Ok(session)) =
-                (self.audio_socket.as_ref(), self.shared.session.try_lock())
-            {
+            // Lock-free: the net thread mirrors the session into atomics.
+            // A stale token/addr pair during a controller swap is harmless,
+            // the app drops packets with the wrong token.
+            let token = self.shared.pub_token.load(Ordering::Acquire);
+            if token == 0 {
                 // No controller: the ring draining is not an underrun.
-                if session.is_none() {
-                    self.primed = false;
+                self.primed = false;
+            } else if let Some(socket) = self.audio_socket.as_ref() {
+                let addr = unpack_addr(self.shared.pub_addr.load(Ordering::Relaxed));
+                Packet::Consumed {
+                    token,
+                    stream_frame: consumed,
+                    fill_frames: fill,
+                    target_frames,
                 }
-                if let Some(session) = &*session {
-                    Packet::Consumed {
-                        token: session.token,
-                        stream_frame: consumed,
-                        fill_frames: fill,
-                        target_frames,
-                    }
-                    .encode(&mut self.scratch);
-                    let _ = socket.send_to(&self.scratch, session.addr);
-                }
+                .encode(&mut self.scratch);
+                let _ = socket.send_to(&self.scratch, addr);
             }
         }
 
@@ -507,6 +555,7 @@ fn net_thread(ctx: NetContext) {
                 .is_some_and(|s| s.last_rx.elapsed() > SESSION_TIMEOUT)
             {
                 *session = None;
+                publish_session(&ctx.shared, None);
             }
         }
 
@@ -578,6 +627,7 @@ fn net_thread(ctx: NetContext) {
                         token,
                         last_rx: Instant::now(),
                     });
+                    publish_session(&ctx.shared, session.as_ref());
                     drop(session);
                     Packet::Welcome {
                         token,
@@ -612,6 +662,7 @@ fn net_thread(ctx: NetContext) {
                 let mut session = ctx.shared.session.lock().unwrap();
                 if session.as_ref().is_some_and(|s| s.token == token) {
                     *session = None;
+                    publish_session(&ctx.shared, None);
                 }
             }
             Packet::SetName {
@@ -888,6 +939,8 @@ mod tests {
     fn net_thread_session_loopback() {
         let shared = Arc::new(Shared {
             session: Mutex::new(None),
+            pub_token: AtomicU64::new(0),
+            pub_addr: AtomicU64::new(0),
             consumed: AtomicU64::new(0),
             fill_frames: AtomicU32::new(0),
             sample_rate: AtomicU32::new(48000),
@@ -1016,6 +1069,8 @@ mod tests {
                 producer,
                 shared: Arc::new(Shared {
                     session: Mutex::new(None),
+                    pub_token: AtomicU64::new(0),
+                    pub_addr: AtomicU64::new(0),
                     consumed: AtomicU64::new(0),
                     fill_frames: AtomicU32::new(0),
                     sample_rate: AtomicU32::new(48000),
